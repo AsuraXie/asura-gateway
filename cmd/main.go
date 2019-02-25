@@ -13,3 +13,4 @@ func main() {
 	config.ServerConfig.LoadConfig(*confPath)
 	server.StartGateWay()
 }
+master 2
