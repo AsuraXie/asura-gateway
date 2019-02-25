@@ -13,3 +13,5 @@ func main() {
 	config.ServerConfig.LoadConfig(*confPath)
 	server.StartGateWay()
 }
+
+1
