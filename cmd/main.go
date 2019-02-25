@@ -14,3 +14,5 @@ func main() {
 	server.StartGateWay()
 }
 master 2
+
+1
