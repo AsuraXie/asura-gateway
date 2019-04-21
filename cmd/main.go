@@ -3,17 +3,14 @@ package main
 import (
 	"asura-gateway/config"
 	"asura-gateway/server"
-	"flag"
 )
 
-var confPath = flag.String("conf", "../conf/gateway.conf", "gateway config file")
-
 func main() {
-	flag.Parse()
-	config.ServerConfig.LoadConfig(*confPath)
-	server.StartGateWay()
-}
-master 2
+	conf := config.LoadConfig()
+	go func() {
+		server.TestServer()
+	}()
 
-1
-2
+	server := &server.GateWayServer{}
+	server.Start(conf)
+}

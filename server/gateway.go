@@ -1,192 +1,135 @@
 package server
 
 import (
-	"asura-gateway/config"
+	"asura-gateway/log"
+	"asura-gateway/request"
+	"asura-gateway/response"
+	"asura-gateway/util"
 	"context"
-	"errors"
-	"fmt"
+	"github.com/gin-gonic/gin"
 	"io/ioutil"
 	"net/http"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 )
 
-func StartGateWay() {
-	http.HandleFunc("/metrics", MetricsHandler)
-	http.HandleFunc("/health", HealthHandler)
-	http.HandleFunc("/gw", gwHandler)
-	if err := http.ListenAndServe(getListenAddr(), nil); err != nil {
-		fmt.Println("start gateway error ", err.Error())
+func GateWayHandler(c *gin.Context) {
+
+	req := &request.GwRequest{}
+	err := req.ParseRequest(c.Request)
+	if err != nil{
+		c.JSON(http.StatusBadRequest,err.Error())
+		return
 	}
-}
 
-func getListenAddr() string {
-	port := strconv.Itoa(config.ServerConfig.ListenPort)
-
-	var listenAddr string
-	if strings.Contains(config.ServerConfig.ListenAddress, "*") {
-		listenAddr = ":" + port
+	result, err := GateWayProcess(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, err.Error())
 	} else {
-		listenAddr = config.ServerConfig.ListenAddress + ":" + port
+		c.JSON(http.StatusOK, result)
 	}
-
-	fmt.Println("gateway is start ,listen on " + listenAddr)
-	return listenAddr
 }
 
-func gwHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		w.Write([]byte("Method Error"))
-		return
-	}
-
-	req := GwRequest{}
-	if err := req.ParseRequest(*r); err != nil {
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	resp := ParallelRequest(req)
-	w.Write(resp.FillResponse())
-	req.EndTime()
-	MetricRequestPoint(req)
+func GateWayProcess(req *request.GwRequest)(*response.GwResponse,error){
+	resp,err := ParallelRequest(req)
+	return resp,err
 }
 
-func ParallelRequest(allReq GwRequest) GwResponse {
-	var wg sync.WaitGroup
-	resp := GwResponse{}
-	writeLock := sync.Mutex{}
+
+func ParallelRequest(allReq *request.GwRequest) (*response.GwResponse,error) {
+	var reqCnt = len(allReq.RequestArray)
+	RespChannel := make(chan *response.SingleResponse,5)
+
+	resp := &response.GwResponse{}
+
 	for _, r := range allReq.RequestArray {
-		wg.Add(1)
-		go func(r SingleReq) {
-			var s = SingleResponse{}
-			if r.Post == "" {
-				s = DoGet(r)
-			} else if r.Post != "" {
-				s = DoPost(r)
+		go func(req request.SingleReq,respChannel chan *response.SingleResponse) {
+			var result = make(chan *response.SingleResponse)
+			ctx,cancel := context.WithTimeout(context.Background(),1*time.Second)
+			defer cancel()
+
+			var s response.SingleResponse
+			if req.Post != "" {
+				go DoQuery(ctx,"POST", req, allReq.Header,result)
+			} else if req.Post == "" {
+				go DoQuery(ctx,"GET", req, allReq.Header,result)
 			}
-			writeLock.Lock()
-			resp.Data = append(resp.Data, s)
-			writeLock.Unlock()
-			wg.Done()
-		}(r)
+
+			select {
+			case <- ctx.Done():
+				s.Code = http.StatusInternalServerError
+				s.Msg = "request time over limit"
+				s.Url = req.Url
+				log.Info("request time over limit,method:%v,request:%v",req.Url,req.Header)
+				respChannel<-&s
+				return
+				case data :=<-result:
+					respChannel<-data
+					return
+			}
+		}(r,RespChannel)
 	}
-	wg.Wait()
-	return resp
+
+
+	for i:=0;i<reqCnt;i++{
+		select {
+		case data := <-RespChannel:
+			resp.Data = append(resp.Data,data)
+		}
+	}
+	return resp,nil
 }
 
-func DoGet(r SingleReq) SingleResponse {
-	currResp := SingleResponse{Code: 500, Url: r.Url}
-	if err := CheckParam(&r); err != nil {
+func DoQuery(ctx context.Context,method string, r request.SingleReq, p http.Header,respChannel chan  *response.SingleResponse) {
+	currResp := &response.SingleResponse{Code: 500, Url: r.Url}
+	if err := util.CheckProtocol(r.Url); err != nil {
 		currResp.Msg = err.Error()
-		return currResp
+		respChannel<-currResp
+		return
 	}
-	request, err := http.NewRequest("GET", r.Url, nil)
+	request, err := http.NewRequest(method, r.Url, nil)
 	if err != nil {
 		currResp.Msg = err.Error()
-		return currResp
+		respChannel<-currResp
+		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	request.WithContext(ctx)
-	timer := time.AfterFunc(2*time.Second, func() {
-		fmt.Println("time limit execed,1 second")
-		cancel()
-	})
 
-	FillHeader(r, request)
+	FillHeader(r, p, request)
+
 	client := http.Client{}
 	resp, err := client.Do(request)
-	timer.Stop()
 	if err != nil {
 		currResp.Msg = err.Error()
-		return currResp
-	}
+		respChannel<-currResp
+		return
+		}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
-	fmt.Println(resp)
-	fmt.Print("Get" + string(body))
 	if err != nil {
 		currResp.Code = 500
 		currResp.Msg = err.Error()
-		return currResp
-	}
+		respChannel<-currResp
+		return
+		}
 	currResp.Code = resp.StatusCode
 	currResp.Msg = "ok"
 	currResp.Data = string(body)
-	return currResp
+	respChannel<- currResp
 }
 
-func DoPost(r SingleReq) SingleResponse {
-	currResp := SingleResponse{Code: 500, Url: r.Url}
-	if err := CheckParam(&r); err != nil {
-		currResp.Msg = err.Error()
-		return currResp
+func FillHeader(r request.SingleReq, p http.Header, req *http.Request) {
+	for key,value := range r.Header {
+		req.Header[key] = value
 	}
 
-	request, err := http.NewRequest("POST", r.Url, strings.NewReader(r.Post))
-	if err != nil {
-		currResp.Msg = err.Error()
-		return currResp
+	for key,value := range p {
+		if _,ok := req.Header[key];!ok {
+			valStr := ""
+			for _,v := range value{
+				valStr = valStr + v + ";"
+			}
+			req.Header.Set(key,valStr)
+		}
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	request.WithContext(ctx)
-	timer := time.AfterFunc(2*time.Second, func() {
-		fmt.Println("time limit execed,1 second")
-		cancel()
-	})
-
-	FillHeader(r, request)
-	client := http.Client{}
-	resp, err := client.Do(request)
-	timer.Stop()
-
-	if err != nil {
-		currResp.Msg = err.Error()
-		return currResp
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		currResp.Msg = err.Error()
-		return currResp
-	}
-	fmt.Println(string(body))
-	currResp.Code = resp.StatusCode
-	currResp.Msg = "ok"
-	currResp.Data = string(body)
-	return currResp
-}
-
-func FillHeader(r SingleReq, req *http.Request) {
-	if r.ContentType != "" {
-		req.Header.Set("Content-Type", r.ContentType)
-	}
-
-	if r.Host != "" {
-		req.Header.Set("Host", r.Host)
-	} else {
-		req.Header.Set("Host", GetHostFromUrl(r.Url))
-	}
-
-	if r.Cookie != "" {
-		req.Header.Set("Cookie", r.Cookie)
-	}
-}
-
-func GetHostFromUrl(url string) string {
-	var urlArray = strings.Split(url, "?")
-	return urlArray[0]
-}
-
-func CheckParam(r *SingleReq) error {
-	if !strings.Contains(r.Url, "http") {
-		return errors.New("miss protocl http")
-	}
-	return nil
 }
